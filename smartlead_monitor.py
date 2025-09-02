@@ -238,11 +238,10 @@ class SmartleadAPI:
         logger.info(f"Total connected accounts: {len(connected_ids)}")
         return connected_ids
 
+from psycopg2.extras import execute_values
 class DatabaseManager:
     
     """Manager for Supabase database operations"""
-
-from psycopg2.extras import execute_values
 
     def resolve_reconnections_by_difference(self, current_disconnected_ids: Set[int]) -> int:
         """Mark previously active disconnections as resolved if they are not in the current disconnected set."""
