@@ -36,16 +36,16 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 class Config:
-    # API Configuration
-    SMARTLEAD_API_KEY = os.getenv('SMARTLEAD_API_KEY', '2fbf4f7d-44af-4ff1-8e25-5655f5483fd0_94zyakr')
+    # API Configuration - Using Bearer Token instead of API Key
+    SMARTLEAD_BEARER_TOKEN = os.getenv('SMARTLEAD_BEARER_TOKEN')
     SMARTLEAD_BASE_URL = 'https://server.smartlead.ai/api'
     
     # Slack Configuration
     SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
     SLACK_CHANNEL_ID = os.getenv('SLACK_CHANNEL_ID', '#monitoring')
     
-    # Database Configuration
-    DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:SB0dailyreporting@db.auzoezucrrhrtmaucbbg.supabase.co:5432/postgres')
+    # Database Configuration - Use transaction pooler for serverless environments
+    DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:SB0dailyreporting@db.auzoezucrrhrtmaucbbg.supabase.co:6543/postgres?pgbouncer=true')
     
     # File paths
     CSV_DIR = Path(os.getenv('CSV_DIR', './audit_logs'))
@@ -109,12 +109,13 @@ class RateLimiter:
 class SmartleadAPI:
     """Smartlead API client with rate limiting and retry logic"""
     
-    def __init__(self, api_key: str, base_url: str):
-        self.api_key = api_key
+    def __init__(self, bearer_token: str, base_url: str):
+        self.bearer_token = bearer_token
         self.base_url = base_url
         self.session = requests.Session()
         self.session.headers.update({
-            'accept': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {bearer_token}',
             'Content-Type': 'application/json'
         })
         self.rate_limiter = RateLimiter(Config.REQUESTS_PER_2_SECONDS, 2.0)
@@ -129,7 +130,7 @@ class SmartleadAPI:
         """Make API request with retry logic"""
         self.rate_limiter.wait_if_needed()
         
-        params['api_key'] = self.api_key
+        # Don't add api_key to params for Bearer auth
         url = f"{self.base_url}/{endpoint}"
         
         logger.debug(f"Making request to {url}")
@@ -139,13 +140,14 @@ class SmartleadAPI:
         return response.json()
     
     def fetch_all_accounts(self) -> List[EmailAccount]:
-        """Fetch all email accounts"""
+        """Fetch all email accounts including disconnected ones"""
         logger.info("Fetching all email accounts...")
         
         accounts = []
         offset = 0
         limit = 1000
         
+        # First fetch all accounts
         while True:
             try:
                 response = self._make_request(
@@ -185,8 +187,15 @@ class SmartleadAPI:
                 offset += limit
                 logger.info(f"Fetched {len(accounts)} accounts so far...")
                 
+                # If we got less than limit, we've reached the end
+                if len(email_accounts) < limit:
+                    break
+                    
             except Exception as e:
                 logger.error(f"Error fetching accounts at offset {offset}: {e}")
+                if offset == 0:
+                    # If we failed on the first request, raise the error
+                    raise
                 break
         
         logger.info(f"Total accounts fetched: {len(accounts)}")
@@ -197,11 +206,25 @@ class DatabaseManager:
     
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
-        self._ensure_table_exists()
+        # Only create table if needed, don't fail if network issues
+        try:
+            self._ensure_table_exists()
+        except Exception as e:
+            logger.warning(f"Could not verify/create table (may already exist): {e}")
     
     def _get_connection(self):
-        """Get database connection"""
-        return psycopg2.connect(self.connection_string)
+        """Get database connection with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Try connection with shorter timeout
+                conn = psycopg2.connect(self.connection_string, connect_timeout=10)
+                return conn
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Database connection attempt {attempt + 1} failed: {e}")
+                time.sleep(2 ** attempt)  # Exponential backoff
     
     def _ensure_table_exists(self):
         """Create table if it doesn't exist"""
@@ -510,7 +533,7 @@ class SmartleadMonitor:
     """Main monitor orchestrator"""
     
     def __init__(self):
-        self.api = SmartleadAPI(Config.SMARTLEAD_API_KEY, Config.SMARTLEAD_BASE_URL)
+        self.api = SmartleadAPI(Config.SMARTLEAD_BEARER_TOKEN, Config.SMARTLEAD_BASE_URL)
         self.db = DatabaseManager(Config.DATABASE_URL)
         self.csv_logger = CSVLogger(Config.CSV_DIR)
         self.slack = SlackNotifier(Config.SLACK_BOT_TOKEN, Config.SLACK_CHANNEL_ID)
@@ -589,6 +612,10 @@ class SmartleadMonitor:
 def main():
     """Main entry point"""
     # Check required environment variables
+    if not Config.SMARTLEAD_BEARER_TOKEN:
+        logger.error("SMARTLEAD_BEARER_TOKEN environment variable not set")
+        sys.exit(1)
+    
     if not Config.SLACK_BOT_TOKEN:
         logger.error("SLACK_BOT_TOKEN environment variable not set")
         sys.exit(1)
