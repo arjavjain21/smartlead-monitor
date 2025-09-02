@@ -15,7 +15,7 @@ from typing import List, Dict, Set, Tuple, Optional
 import requests
 from dataclasses import dataclass, asdict
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_batch
 import hashlib
 from pathlib import Path
 from slack_sdk import WebClient
@@ -314,6 +314,9 @@ class DatabaseManager:
     
     def record_disconnections(self, accounts: List[EmailAccount], check_run_id: str) -> List[EmailAccount]:
         """Record new disconnections and return newly disconnected accounts"""
+        if not accounts:
+            return []
+            
         active_disconnections = self.get_active_disconnections()
         newly_disconnected = []
         
@@ -333,6 +336,10 @@ class DatabaseManager:
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cursor:
+                    # Prepare batch data
+                    insert_data = []
+                    reactivate_ids = []
+                    
                     for account in accounts:
                         if account.is_disconnected:
                             tags_str = ','.join(account.tags) if account.tags else ''
@@ -341,8 +348,8 @@ class DatabaseManager:
                             if account.id not in active_disconnections:
                                 newly_disconnected.append(account)
                                 
-                                # Insert new disconnection record
-                                cursor.execute(insert_query, (
+                                # Add to batch insert
+                                insert_data.append((
                                     account.id,
                                     account.from_name,
                                     account.from_email,
@@ -353,10 +360,22 @@ class DatabaseManager:
                                     check_run_id
                                 ))
                                 
-                                # Reactivate if it was previously resolved
-                                cursor.execute(update_active_query, (account.id,))
+                                # Track for reactivation
+                                reactivate_ids.append(account.id)
+                    
+                    # Bulk insert new disconnections
+                    if insert_data:
+                        from psycopg2.extras import execute_batch
+                        execute_batch(cursor, insert_query, insert_data, page_size=100)
+                        logger.info(f"Bulk inserted {len(insert_data)} new disconnection records")
+                    
+                    # Bulk update reactivations
+                    if reactivate_ids:
+                        execute_batch(cursor, update_active_query, [(id,) for id in reactivate_ids], page_size=100)
+                        logger.info(f"Reactivated {len(reactivate_ids)} previously resolved accounts")
                 
                 conn.commit()
+                
         except Exception as e:
             logger.error(f"Error recording disconnections: {e}")
         
@@ -622,15 +641,17 @@ class SmartleadMonitor:
             if is_first_run:
                 # On first run, all disconnected accounts are "new"
                 newly_disconnected = disconnected
-                logger.info(f"First run: marking all {len(disconnected)} as newly disconnected")
-                # Record them in database in batches
-                for i in range(0, len(disconnected), 100):
-                    batch = disconnected[i:i+100]
-                    for account in batch:
-                        self.db.record_disconnections([account], check_run_id)
-                    logger.info(f"Recorded batch {i//100 + 1}/{(len(disconnected)//100) + 1}")
+                logger.info(f"First run: recording all {len(disconnected)} disconnected accounts")
+                
+                # Use bulk recording for first run
+                if disconnected:
+                    # Pass all at once for bulk insert
+                    self.db.record_disconnections(disconnected, check_run_id)
+                    logger.info("All disconnections recorded successfully")
             else:
+                # Normal run - incremental check
                 newly_disconnected = self.db.record_disconnections(disconnected, check_run_id)
+                logger.info(f"Found {len(newly_disconnected)} newly disconnected accounts")
             
             # Resolve reconnections
             self.db.resolve_reconnections(connected_ids)
