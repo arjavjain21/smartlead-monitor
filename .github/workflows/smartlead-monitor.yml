@@ -12,7 +12,7 @@ on:
         default: 'no'
 
 env:
-  SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
+  SMARTLEAD_BEARER_TOKEN: ${{ secrets.SMARTLEAD_BEARER_TOKEN }}
   SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
   SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -57,6 +57,13 @@ jobs:
         name: monitor-state
         path: state/
       continue-on-error: true
+      id: download-artifact
+    
+    - name: Create state directory if artifact not found
+      if: steps.download-artifact.outcome == 'failure'
+      run: |
+        echo "No previous state found, creating state directory"
+        mkdir -p state
     
     - name: Run monitor check
       run: |
