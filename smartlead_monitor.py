@@ -239,7 +239,44 @@ class SmartleadAPI:
         return connected_ids
 
 class DatabaseManager:
+    
     """Manager for Supabase database operations"""
+
+from psycopg2.extras import execute_values
+
+    def resolve_reconnections_by_difference(self, current_disconnected_ids: Set[int]) -> int:
+        """Mark previously active disconnections as resolved if they are not in the current disconnected set."""
+        current_ids = list(current_disconnected_ids or [])
+        now = datetime.now()
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    if not current_ids:
+                        # No accounts are disconnected now, resolve all active
+                        cursor.execute(
+                            "UPDATE disconnected_accounts "
+                            "SET is_active = FALSE, resolved_at = %s "
+                            "WHERE is_active = TRUE",
+                            (now,)
+                        )
+                        resolved = cursor.rowcount
+                    else:
+                        # Resolve all active accounts that are NOT in the current disconnected list
+                        cursor.execute(
+                            "UPDATE disconnected_accounts "
+                            "SET is_active = FALSE, resolved_at = %s "
+                            "WHERE is_active = TRUE AND NOT (account_id = ANY(%s))",
+                            (now, current_ids)
+                        )
+                        resolved = cursor.rowcount
+                conn.commit()
+            if resolved:
+                logger.info(f"Resolved {resolved} reconnected accounts")
+            return resolved
+        except Exception as e:
+            logger.error(f"Error resolving reconnections: {e}")
+            return 0
+
     
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
@@ -365,17 +402,33 @@ class DatabaseManager:
                     
                     # Bulk insert new disconnections
                     if insert_data:
-                        from psycopg2.extras import execute_batch
-                        execute_batch(cursor, insert_query, insert_data, page_size=100)
-                        logger.info(f"Bulk inserted {len(insert_data)} new disconnection records")
+                        from psycopg2.extras import execute_values
+                        
+                        insert_sql = (
+                            "INSERT INTO disconnected_accounts "
+                            "(account_id, from_name, from_email, account_type, disconnection_type, tags, detected_at, check_run_id) "
+                            "VALUES %s "
+                            "ON CONFLICT (account_id, detected_at) DO NOTHING"
+                        )
+                        if insert_data:
+                            execute_values(cursor, insert_sql, insert_data, page_size=1000)
+                            logger.info(f"Bulk inserted {len(insert_data)} new disconnection records")
+
                     
                     # Bulk update reactivations
+                    # After you collect reactivate_ids
                     if reactivate_ids:
-                        execute_batch(cursor, update_active_query, [(id,) for id in reactivate_ids], page_size=100)
+                        with self._get_connection() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute(
+                                    "UPDATE disconnected_accounts "
+                                    "SET is_active = TRUE, resolved_at = NULL "
+                                    "WHERE is_active = FALSE AND account_id = ANY(%s)",
+                                    (reactivate_ids,)
+                                )
+                            conn.commit()
                         logger.info(f"Reactivated {len(reactivate_ids)} previously resolved accounts")
-                
-                conn.commit()
-                
+
         except Exception as e:
             logger.error(f"Error recording disconnections: {e}")
         
@@ -627,9 +680,10 @@ class SmartleadMonitor:
             if time.time() - start_time > max_runtime:
                 raise TimeoutError("Script runtime exceeded 10 minutes")
             
-            # OPTIMIZED: Only fetch connected IDs for reconnection tracking
-            logger.info("Step 2: Fetching connected account IDs for reconnection tracking...")
-            connected_ids = self.api.fetch_connected_account_ids()
+            logger.info("Step 2: Resolving reconnections by DB difference, no full scan...")
+            current_disconnected_ids = {a.id for a in disconnected}
+            self.db.resolve_reconnections_by_difference(current_disconnected_ids)
+
             
             # Check timeout
             if time.time() - start_time > max_runtime:
