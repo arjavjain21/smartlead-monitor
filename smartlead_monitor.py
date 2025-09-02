@@ -690,7 +690,7 @@ class SmartleadMonitor:
             if time.time() - start_time > max_runtime:
                 raise TimeoutError("Script runtime exceeded 10 minutes")
             
-            logger.info(f"Summary: {len(disconnected)} disconnected, {len(connected_ids)} connected")
+            # logger.info(f"Summary: {len(disconnected)} disconnected, {len(connected_ids)} connected")
             
             # Record disconnections and get newly disconnected
             if is_first_run:
