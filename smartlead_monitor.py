@@ -243,6 +243,81 @@ class DatabaseManager:
     
     """Manager for Supabase database operations"""
 
+
+    def diff_and_apply(
+        self,
+        current: dict[int, dict],  # account_id -> {from_name, from_email, account_type, disconnection_type, tags}
+        check_run_id: str,
+    ) -> tuple[list[int], int]:
+        """
+        Returns (new_ids, resolved_count).
+        Does all reads and writes in one transaction.
+        """
+        now = datetime.now()
+        cur_ids = list(current.keys())
+    
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                # 1. Snapshot A0, the set of active disconnected accounts at start of run
+                cursor.execute(
+                    "SELECT account_id FROM disconnected_accounts WHERE is_active = TRUE"
+                )
+                a0 = {row[0] for row in cursor.fetchall()}
+    
+                d = set(cur_ids)
+    
+                # 2. Compute pure set differences before any mutation
+                new_ids = list(d - a0)            # newly disconnected this run
+                resolved_ids = list(a0 - d)       # reconnected since last run
+    
+                # 3. Resolve reconnected in one bulk update
+                if resolved_ids:
+                    cursor.execute(
+                        "UPDATE disconnected_accounts "
+                        "SET is_active = FALSE, resolved_at = %s "
+                        "WHERE is_active = TRUE AND account_id = ANY(%s)",
+                        (now, resolved_ids),
+                    )
+                    resolved_count = cursor.rowcount
+                else:
+                    resolved_count = 0
+    
+                # 4. Insert only newly disconnected rows, no reactivations of old rows
+                if new_ids:
+                    rows = []
+                    for acc_id in new_ids:
+                        meta = current[acc_id]
+                        rows.append((
+                            acc_id,
+                            meta.get("from_name"),
+                            meta.get("from_email"),
+                            meta.get("account_type"),
+                            meta.get("disconnection_type"),
+                            json.dumps(meta.get("tags") or []),
+                            now,          # detected_at
+                            None,         # resolved_at
+                            True,         # is_active
+                            check_run_id,
+                        ))
+                    execute_values(
+                        cursor,
+                        """
+                        INSERT INTO disconnected_accounts
+                        (account_id, from_name, from_email, account_type, disconnection_type, tags,
+                         detected_at, resolved_at, is_active, check_run_id)
+                        VALUES %s
+                        ON CONFLICT ON CONSTRAINT ux_da_active_account DO NOTHING
+                        """,
+                        rows,
+                        page_size=1000,
+                    )
+    
+            conn.commit()
+    
+        return new_ids, resolved_count
+
+
+    
     def resolve_reconnections_by_difference(self, current_disconnected_ids: set[int]) -> int:
         """
         Mark previously active disconnections as resolved when they are not in the current disconnected set.
@@ -685,6 +760,25 @@ class SmartleadMonitor:
             current_disconnected_ids = {a.id for a in disconnected}
             self.db.resolve_reconnections_by_difference(current_disconnected_ids)
 
+
+            # disconnected: list[Account] from API filter isImapSuccess=false & isSmtpSuccess=false
+            current = {}
+            for acc in disconnected:
+                current[acc.id] = {
+                    "from_name": acc.from_name,
+                    "from_email": acc.from_email,
+                    "account_type": acc.type,
+                    "disconnection_type": _infer_disconnection_type(acc),  # e.g., "SMTP_ONLY" or "BOTH"
+                    "tags": acc.tags or [],
+                }
+            
+            logger.info("Step 2: Resolving reconnections and inserting only pure new disconnections...")
+            new_ids, resolved_count = self.db.diff_and_apply(current, check_run_id)
+            
+            logger.info(f"Summary: {len(disconnected)} currently disconnected, "
+                        f"new this run: {len(new_ids)}, resolved: {resolved_count}")
+
+            
             
             # Check timeout
             if time.time() - start_time > max_runtime:
