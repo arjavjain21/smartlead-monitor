@@ -139,24 +139,75 @@ class SmartleadAPI:
         
         return response.json()
     
-    def fetch_all_accounts(self) -> List[EmailAccount]:
-        """Fetch all email accounts including disconnected ones"""
-        logger.info("Fetching all email accounts...")
+    def fetch_disconnected_accounts(self) -> List[EmailAccount]:
+        """Fetch only disconnected accounts using the dedicated endpoint"""
+        logger.info("Fetching disconnected accounts directly...")
         
-        accounts = []
+        disconnected = []
         offset = 0
-        limit = 1000
+        limit = 10000  # Larger limit for faster fetching
         
-        # First fetch all accounts
+        try:
+            response = self._make_request(
+                'email-account/get-total-email-accounts',
+                {
+                    'offset': offset, 
+                    'limit': limit,
+                    'isImapSuccess': 'false',
+                    'isSmtpSuccess': 'false'
+                }
+            )
+            
+            if not response.get('ok'):
+                logger.error(f"API error: {response.get('message')}")
+                return disconnected
+            
+            email_accounts = response.get('data', {}).get('email_accounts', [])
+            logger.info(f"Found {len(email_accounts)} disconnected accounts")
+            
+            for acc in email_accounts:
+                tags = []
+                for tag_mapping in acc.get('email_account_tag_mappings', []):
+                    if 'tag' in tag_mapping and 'name' in tag_mapping['tag']:
+                        tags.append(tag_mapping['tag']['name'])
+                
+                account = EmailAccount(
+                    id=acc['id'],
+                    from_name=acc.get('from_name', ''),
+                    from_email=acc.get('from_email', ''),
+                    type=acc.get('type', 'UNKNOWN'),
+                    is_smtp_success=acc.get('is_smtp_success', False),
+                    is_imap_success=acc.get('is_imap_success', False),
+                    tags=tags,
+                    message_per_day=acc.get('message_per_day', 0),
+                    daily_sent_count=acc.get('daily_sent_count', 0),
+                    client_id=acc.get('client_id')
+                )
+                disconnected.append(account)
+                
+        except Exception as e:
+            logger.error(f"Error fetching disconnected accounts: {e}")
+            raise
+        
+        return disconnected
+    
+    def fetch_connected_account_ids(self) -> Set[int]:
+        """Fetch only IDs of connected accounts for reconnection tracking"""
+        logger.info("Fetching connected account IDs...")
+        
+        connected_ids = set()
+        offset = 0
+        limit = 10000  # Larger limit
+        
         while True:
             try:
+                # This fetches ALL accounts - we'll extract connected ones
                 response = self._make_request(
                     'email-account/get-total-email-accounts',
                     {'offset': offset, 'limit': limit}
                 )
                 
                 if not response.get('ok'):
-                    logger.error(f"API error: {response.get('message')}")
                     break
                 
                 email_accounts = response.get('data', {}).get('email_accounts', [])
@@ -164,42 +215,28 @@ class SmartleadAPI:
                 if not email_accounts:
                     break
                 
+                # Only store IDs of connected accounts
                 for acc in email_accounts:
-                    tags = []
-                    for tag_mapping in acc.get('email_account_tag_mappings', []):
-                        if 'tag' in tag_mapping and 'name' in tag_mapping['tag']:
-                            tags.append(tag_mapping['tag']['name'])
-                    
-                    account = EmailAccount(
-                        id=acc['id'],
-                        from_name=acc.get('from_name', ''),
-                        from_email=acc.get('from_email', ''),
-                        type=acc.get('type', 'UNKNOWN'),
-                        is_smtp_success=acc.get('is_smtp_success', False),
-                        is_imap_success=acc.get('is_imap_success', False),
-                        tags=tags,
-                        message_per_day=acc.get('message_per_day', 0),
-                        daily_sent_count=acc.get('daily_sent_count', 0),
-                        client_id=acc.get('client_id')
-                    )
-                    accounts.append(account)
+                    is_smtp = acc.get('is_smtp_success', False)
+                    is_imap = acc.get('is_imap_success', False)
+                    if is_smtp and is_imap:
+                        connected_ids.add(acc['id'])
                 
-                offset += limit
-                logger.info(f"Fetched {len(accounts)} accounts so far...")
+                logger.info(f"Processed {offset + len(email_accounts)} accounts, found {len(connected_ids)} connected...")
                 
-                # If we got less than limit, we've reached the end
                 if len(email_accounts) < limit:
                     break
                     
+                offset += limit
+                
             except Exception as e:
-                logger.error(f"Error fetching accounts at offset {offset}: {e}")
+                logger.error(f"Error at offset {offset}: {e}")
                 if offset == 0:
-                    # If we failed on the first request, raise the error
                     raise
                 break
         
-        logger.info(f"Total accounts fetched: {len(accounts)}")
-        return accounts
+        logger.info(f"Total connected accounts: {len(connected_ids)}")
+        return connected_ids
 
 class DatabaseManager:
     """Manager for Supabase database operations"""
@@ -550,6 +587,10 @@ class SmartleadMonitor:
         check_run_id = self.generate_run_id()
         logger.info(f"Starting check run: {check_run_id}")
         
+        # Add timeout protection
+        start_time = time.time()
+        max_runtime = 600  # 10 minutes max
+        
         try:
             # Load previous state
             state = self.state_manager.load_state()
@@ -559,25 +600,35 @@ class SmartleadMonitor:
             if not last_check:
                 is_first_run = True
             
-            # Fetch all accounts
-            all_accounts = self.api.fetch_all_accounts()
+            # OPTIMIZED: Fetch disconnected accounts directly
+            logger.info("Step 1: Fetching disconnected accounts...")
+            disconnected = self.api.fetch_disconnected_accounts()
             
-            if not all_accounts:
-                raise Exception("No accounts fetched from API")
+            # Check timeout
+            if time.time() - start_time > max_runtime:
+                raise TimeoutError("Script runtime exceeded 10 minutes")
             
-            # Separate connected and disconnected accounts
-            disconnected = [acc for acc in all_accounts if acc.is_disconnected]
-            connected_ids = {acc.id for acc in all_accounts if not acc.is_disconnected}
+            # OPTIMIZED: Only fetch connected IDs for reconnection tracking
+            logger.info("Step 2: Fetching connected account IDs for reconnection tracking...")
+            connected_ids = self.api.fetch_connected_account_ids()
             
-            logger.info(f"Total accounts: {len(all_accounts)}, Disconnected: {len(disconnected)}")
+            # Check timeout
+            if time.time() - start_time > max_runtime:
+                raise TimeoutError("Script runtime exceeded 10 minutes")
+            
+            logger.info(f"Summary: {len(disconnected)} disconnected, {len(connected_ids)} connected")
             
             # Record disconnections and get newly disconnected
             if is_first_run:
                 # On first run, all disconnected accounts are "new"
                 newly_disconnected = disconnected
-                # Record them in database
-                for account in disconnected:
-                    self.db.record_disconnections([account], check_run_id)
+                logger.info(f"First run: marking all {len(disconnected)} as newly disconnected")
+                # Record them in database in batches
+                for i in range(0, len(disconnected), 100):
+                    batch = disconnected[i:i+100]
+                    for account in batch:
+                        self.db.record_disconnections([account], check_run_id)
+                    logger.info(f"Recorded batch {i//100 + 1}/{(len(disconnected)//100) + 1}")
             else:
                 newly_disconnected = self.db.record_disconnections(disconnected, check_run_id)
             
@@ -597,13 +648,18 @@ class SmartleadMonitor:
             # Update state
             state['last_check'] = datetime.now().isoformat()
             state['last_run_id'] = check_run_id
-            state['total_accounts'] = len(all_accounts)
             state['total_disconnected'] = len(disconnected)
+            state['total_connected'] = len(connected_ids)
             state['newly_disconnected'] = len(newly_disconnected)
+            state['runtime_seconds'] = int(time.time() - start_time)
             self.state_manager.save_state(state)
             
-            logger.info(f"Check completed successfully. New disconnections: {len(newly_disconnected)}")
+            logger.info(f"Check completed in {int(time.time() - start_time)} seconds. New disconnections: {len(newly_disconnected)}")
             
+        except TimeoutError as e:
+            logger.error(f"Timeout error: {e}")
+            self.slack.send_error_notification(str(e), check_run_id)
+            raise
         except Exception as e:
             logger.error(f"Error during check: {e}", exc_info=True)
             self.slack.send_error_notification(str(e), check_run_id)
