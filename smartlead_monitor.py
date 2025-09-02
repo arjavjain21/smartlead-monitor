@@ -768,7 +768,7 @@ class SmartleadMonitor:
                     "from_name": acc.from_name,
                     "from_email": acc.from_email,
                     "account_type": acc.type,
-                    "disconnection_type": _infer_disconnection_type(acc),  # e.g., "SMTP_ONLY" or "BOTH"
+                    "disconnection_type": acc.disconnection_type,  # e.g., "SMTP_ONLY" or "BOTH"
                     "tags": acc.tags or [],
                 }
             
