@@ -3,7 +3,7 @@ name: Smartlead Account Monitor
 on:
   schedule:
     # Run every hour at minute 5
-    - cron: '5 * * * *'
+    - cron: '10 * * * *'
   workflow_dispatch:
     inputs:
       first_run:
