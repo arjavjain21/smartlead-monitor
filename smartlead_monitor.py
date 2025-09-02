@@ -243,15 +243,17 @@ class DatabaseManager:
     
     """Manager for Supabase database operations"""
 
-    def resolve_reconnections_by_difference(self, current_disconnected_ids: Set[int]) -> int:
-        """Mark previously active disconnections as resolved if they are not in the current disconnected set."""
-        current_ids = list(current_disconnected_ids or [])
+    def resolve_reconnections_by_difference(self, current_disconnected_ids: set[int]) -> int:
+        """
+        Mark previously active disconnections as resolved when they are not in the current disconnected set.
+        Returns the number of rows resolved.
+        """
         now = datetime.now()
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cursor:
-                    if not current_ids:
-                        # No accounts are disconnected now, resolve all active
+                    if not current_disconnected_ids:
+                        # No one is disconnected now, resolve all active
                         cursor.execute(
                             "UPDATE disconnected_accounts "
                             "SET is_active = FALSE, resolved_at = %s "
@@ -260,12 +262,12 @@ class DatabaseManager:
                         )
                         resolved = cursor.rowcount
                     else:
-                        # Resolve all active accounts that are NOT in the current disconnected list
+                        # Resolve every active account that is not in the current disconnected list
                         cursor.execute(
                             "UPDATE disconnected_accounts "
                             "SET is_active = FALSE, resolved_at = %s "
                             "WHERE is_active = TRUE AND NOT (account_id = ANY(%s))",
-                            (now, current_ids)
+                            (now, list(current_disconnected_ids),)
                         )
                         resolved = cursor.rowcount
                 conn.commit()
@@ -707,7 +709,7 @@ class SmartleadMonitor:
                 logger.info(f"Found {len(newly_disconnected)} newly disconnected accounts")
             
             # Resolve reconnections
-            self.db.resolve_reconnections(connected_ids)
+            # self.db.resolve_reconnections(connected_ids)
             
             # Log to CSV
             if newly_disconnected:
@@ -723,7 +725,7 @@ class SmartleadMonitor:
             state['last_check'] = datetime.now().isoformat()
             state['last_run_id'] = check_run_id
             state['total_disconnected'] = len(disconnected)
-            state['total_connected'] = len(connected_ids)
+            # state['total_connected'] = len(connected_ids)
             state['newly_disconnected'] = len(newly_disconnected)
             state['runtime_seconds'] = int(time.time() - start_time)
             self.state_manager.save_state(state)
